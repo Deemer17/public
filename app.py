@@ -1,3 +1,9 @@
+import streamlit as st
+
+st.title("Aplikasi Streamlit Saya")
+st.write("Deploy ke Streamlit Cloud")
+
+
 !pip install folium
 import pandas as pd
 import numpy as np
