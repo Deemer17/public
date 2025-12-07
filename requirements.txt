@@ -2,9 +2,9 @@ streamlit
 pandas
 numpy
 scikit-learn
+nltk
 folium
 streamlit-folium
-wordcloud
 matplotlib
-nltk
+wordcloud
 openpyxl
