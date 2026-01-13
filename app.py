@@ -1,13 +1,14 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import io
 import json
 import re
-import folium
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 from sklearn.cluster import KMeans
+from sklearn_extra.cluster import KMedoids
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
@@ -15,47 +16,54 @@ from sklearn.metrics import silhouette_score
 import nltk
 from nltk.corpus import stopwords
 
+import folium
+from streamlit_folium import st_folium
+
 import matplotlib.pyplot as plt
 from wordcloud import WordCloud
 
-# -----------------------------------------------------------
-# NLTK SETUP
-# -----------------------------------------------------------
-def load_nltk():
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt")
 
+# ----------------------------
+# App Config (minimalis)
+# ----------------------------
+st.set_page_config(
+    page_title="Klusterisasi Pengaduan 1500-444 Bekasi",
+    page_icon="📌",
+    layout="wide"
+)
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.2rem; padding-bottom: 2.5rem;}
+    [data-testid="stMetricValue"] {font-size: 1.6rem;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.title("📌 Klusterisasi Pengaduan Masyarakat — Bekasi (1500–444)")
+st.caption("Upload data terbaru atau tambah pengaduan via form. Model final: TF-IDF + K-Means (k=5).")
+
+
+# ----------------------------
+# NLTK (cache + safe)
+# ----------------------------
+@st.cache_resource
+def load_stopwords_id():
     try:
         nltk.data.find("corpora/stopwords")
     except LookupError:
         nltk.download("stopwords")
-
-load_nltk()
-stopwords_ind = stopwords.words("indonesian")
+    return stopwords.words("indonesian")
 
 
-# -----------------------------------------------------------
-# BASIC CLEANING FUNCTIONS
-# -----------------------------------------------------------
-def is_noise(a):
-    a = str(a).lower().strip()
-    if re.fullmatch(r"[0-9\-\+\(\) ]{7,}", a):
-        return True
-    bad = ["pt", "cv", "tbk", "bank", "bca", "kantor", "industri", "factory"]
-    return any(b in a for b in bad)
-
-def bersih(t):
-    t = str(t).lower()
-    t = re.sub(r"[^a-zA-Z0-9\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+STOPWORDS_ID = load_stopwords_id()
 
 
-# -----------------------------------------------------------
-# KECAMATAN CONFIG
-# -----------------------------------------------------------
+# ----------------------------
+# Helpers: Cleaning & Mapping
+# ----------------------------
 KEC_LIST = [
     "Bekasi Timur", "Bekasi Selatan", "Bekasi Utara", "Bekasi Barat",
     "Jatiasih", "Jatisampurna", "Rawalumbu", "Mustika Jaya",
@@ -68,466 +76,411 @@ MAPPING = {
     "Jaticempaka": "Pondokgede",
     "Galaxy": "Bekasi Selatan",
     "Aren Jaya": "Bekasi Timur",
-    "Pejuang": "Medan Satria",
+    "Pejuang": "Medan Satria"
 }
 
-def detect_kec(a):
-    a = str(a)
-    for k, v in MAPPING.items():
-        if k.lower() in a.lower():
-            return v
+REQUIRED_COLS = ["ALAMAT", "PERMASALAHAN"]
+
+
+def is_noise_address(a: str) -> bool:
+    a = str(a).lower().strip()
+    if re.fullmatch(r"[0-9\-\+\(\) ]{7,}", a):
+        return True
+    bad = ["pt", "cv", "tbk", "bank", "bca", "kantor", "industri", "factory"]
+    return any(b in a for b in bad)
+
+
+def detect_kec_from_text(a: str):
+    a_low = str(a).lower()
     for k in KEC_LIST:
-        if k.lower() in a.lower():
+        if k.lower() in a_low:
             return k
     return None
 
 
-# -----------------------------------------------------------
-# GEOJSON UTIL
-# -----------------------------------------------------------
-def get_polygon_from_geojson(geo, kecamatan_up):
-    for feat in geo["features"]:
-        if feat["properties"]["KECAMATAN"].strip().upper() == kecamatan_up.strip().upper():
-            return feat["geometry"]["coordinates"][0]
-    return None
-
-def get_centroid_from_geojson(geo, kec):
-    for feat in geo["features"]:
-        if feat["properties"]["KECAMATAN"].title() == kec.title():
-            coords = np.array(feat["geometry"]["coordinates"][0])
-            lon0 = coords[:, 0].mean()
-            lat0 = coords[:, 1].mean()
-            return lat0, lon0
-    return None, None
+def clean_text(t: str) -> str:
+    t = str(t).lower()
+    t = re.sub(r"[^a-zA-Z0-9\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
-# -----------------------------------------------------------
-# PROCESSING PIPELINE (CACHED)
-# -----------------------------------------------------------
-@st.cache_data(show_spinner=True)
-def process_data(uploaded_excel, uploaded_geojson, n_text_clusters=5, n_kec_clusters=4):
+def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-    df = pd.read_excel(uploaded_excel)
+    for c in REQUIRED_COLS:
+        if c not in df.columns:
+            raise ValueError(f"Kolom '{c}' tidak ditemukan. Wajib ada: {REQUIRED_COLS}")
 
-    if "ALAMAT" not in df.columns or "PERMASALAHAN" not in df.columns:
-        raise ValueError("File Excel wajib memiliki kolom 'ALAMAT' dan 'PERMASALAHAN'.")
-
-    # cleaning alamat
-    df = df[~df["ALAMAT"].astype(str).apply(is_noise)].copy()
+    # Cleaning alamat
+    df = df[~df["ALAMAT"].astype(str).apply(is_noise_address)].copy()
     df["ALAMAT"] = df["ALAMAT"].astype(str).str.title().str.strip()
-    df["KECAMATAN"] = df["ALAMAT"].apply(detect_kec)
-    df = df.dropna(subset=["KECAMATAN"])
-    df["KECAMATAN_UP"] = df["KECAMATAN"].str.upper()
 
-    # text cleaning + TF-IDF
-    df["PERMASALAHAN_CLEAN"] = df["PERMASALAHAN"].apply(bersih)
-    tfidf = TfidfVectorizer(stop_words=stopwords_ind, max_features=2000)
+    # Normalisasi kecamatan
+    df["KECAMATAN"] = df["ALAMAT"].map(MAPPING)
+    df["KECAMATAN"] = df["KECAMATAN"].fillna(df["ALAMAT"].apply(detect_kec_from_text))
+    df = df.dropna(subset=["KECAMATAN"]).copy()
+
+    # Cleaning teks keluhan
+    df["PERMASALAHAN_CLEAN"] = df["PERMASALAHAN"].apply(clean_text)
+
+    # Upper for GeoJSON match
+    df["KECAMATAN_UP"] = df["KECAMATAN"].astype(str).str.strip().str.upper()
+    return df
+
+
+# ----------------------------
+# Modeling
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def run_model(df: pd.DataFrame, k_keluhan: int = 5):
+    # TF-IDF
+    tfidf = TfidfVectorizer(stop_words=STOPWORDS_ID, max_features=2000)
     X_text = tfidf.fit_transform(df["PERMASALAHAN_CLEAN"])
 
-    # clustering keluhan
-    km_text = KMeans(n_clusters=n_text_clusters, random_state=42, n_init=10)
-    df["CLUSTER_KELUHAN"] = km_text.fit_predict(X_text)
+    # K-Means (final)
+    kmeans_keluhan = KMeans(n_clusters=k_keluhan, random_state=42, n_init="auto")
+    labels_kmeans = kmeans_keluhan.fit_predict(X_text)
 
-    # silhouette score
-    sil_score = silhouette_score(X_text, df["CLUSTER_KELUHAN"])
+    sil = None
+    if len(np.unique(labels_kmeans)) > 1:
+        sil = float(silhouette_score(X_text, labels_kmeans))
 
-    # top terms per cluster
+    # K-Medoids (opsional pembanding)
+    kmedoids_keluhan = KMedoids(
+        n_clusters=k_keluhan,
+        metric="cosine",
+        init="k-medoids++",
+        random_state=42
+    )
+    labels_kmedoids = kmedoids_keluhan.fit_predict(X_text)
+
+    out = df.copy()
+    out["CLUSTER_KELUHAN"] = labels_kmeans
+    out["CLUSTER_KELUHAN_MEDOID"] = labels_kmedoids
+
+    # Top terms per cluster (KMeans)
     terms = tfidf.get_feature_names_out()
-    term_top = {}
-    for i in range(n_text_clusters):
-        center = km_text.cluster_centers_[i]
-        top = center.argsort()[-15:][::-1]
-        term_top[i] = [terms[t] for t in top]
+    top_terms = {}
+    centers = kmeans_keluhan.cluster_centers_
+    for i in range(k_keluhan):
+        center = centers[i]
+        idx = center.argsort()[-15:][::-1]
+        top_terms[i] = [terms[j] for j in idx]
 
-    # agregasi per kecamatan
-    kec_total = df.groupby("KECAMATAN").size().reset_index(name="TOTAL_KELUHAN")
-    kec_comp = df.pivot_table(
+    return out, X_text, tfidf, sil, top_terms
+
+
+@st.cache_data(show_spinner=False)
+def build_kecamatan_features(df_modeled: pd.DataFrame, k_keluhan: int = 5):
+    kec_total = df_modeled.groupby("KECAMATAN").size().reset_index(name="TOTAL_KELUHAN")
+
+    kec_comp = df_modeled.pivot_table(
         index="KECAMATAN",
         columns="CLUSTER_KELUHAN",
         aggfunc="size",
         fill_value=0
     )
+    # pastikan kolom CL_0..CL_4 ada lengkap
+    for c in range(k_keluhan):
+        if c not in kec_comp.columns:
+            kec_comp[c] = 0
+    kec_comp = kec_comp[[c for c in range(k_keluhan)]]
     kec_comp.columns = [f"CL_{c}" for c in kec_comp.columns]
+
     kec_features = kec_total.merge(kec_comp, on="KECAMATAN")
-    kec_features["KECAMATAN_UP"] = kec_features["KECAMATAN"].str.upper()
 
-    # clustering kecamatan
+    # clustering kecamatan (k=4)
+    num_cols = [c for c in kec_features.columns if c != "KECAMATAN"]
     scaler = StandardScaler()
-    X_kec = scaler.fit_transform(kec_features.drop(columns=["KECAMATAN", "KECAMATAN_UP"]))
-    km_kec = KMeans(n_clusters=n_kec_clusters, random_state=42, n_init=10)
-    kec_features["CLUSTER_KECAMATAN"] = km_kec.fit_predict(X_kec)
+    X_kec = scaler.fit_transform(kec_features[num_cols])
 
-    # geojson
-    geo = json.load(uploaded_geojson)
+    kmeans_kec = KMeans(n_clusters=4, random_state=42, n_init="auto")
+    kec_features["CLUSTER_KECAMATAN"] = kmeans_kec.fit_predict(X_kec)
 
-    return df, kec_features, geo, sil_score, term_top
+    kmedoids_kec = KMedoids(n_clusters=4, metric="euclidean", random_state=42)
+    kec_features["CLUSTER_KECAMATAN_KMEDOID"] = kmedoids_kec.fit_predict(X_kec)
 
-
-# -----------------------------------------------------------
-# JITTER (STABIL, ANTI FLICKER)
-# -----------------------------------------------------------
-def jitter_point(lat, lon, index):
-    np.random.seed(index)
-    lat_j = lat + np.random.uniform(-0.003, 0.003)
-    lon_j = lon + np.random.uniform(-0.003, 0.003)
-    return lat_j, lon_j
+    kec_features["KECAMATAN_UP"] = kec_features["KECAMATAN"].astype(str).str.strip().str.upper()
+    return kec_features
 
 
-# -----------------------------------------------------------
-# CACHED POINTS (DOT & HEATMAP)
-# -----------------------------------------------------------
-@st.cache_data
-def get_dot_points(df_cl, geo):
-    pts = []
-    for i, row in df_cl.iterrows():
-        lat0, lon0 = get_centroid_from_geojson(geo, row["KECAMATAN"])
-        if lat0 is None:
+# ----------------------------
+# GeoJSON helpers
+# ----------------------------
+def extract_first_ring(geom):
+    t = geom.get("type")
+    coords = geom.get("coordinates")
+    if t == "Polygon":
+        return coords[0]
+    if t == "MultiPolygon":
+        return coords[0][0]
+    return None
+
+
+def build_geo_map(geojson_obj):
+    geo_map = {}
+    for feat in geojson_obj.get("features", []):
+        props = feat.get("properties", {})
+        name = str(props.get("KECAMATAN", "")).strip().upper()
+        ring = extract_first_ring(feat.get("geometry", {}))
+        if name and ring:
+            geo_map[name] = ring
+    return geo_map
+
+
+def centroid_from_ring(ring):
+    arr = np.array(ring)
+    lon = arr[:, 0].mean()
+    lat = arr[:, 1].mean()
+    return float(lat), float(lon)
+
+
+def draw_polygon(m, coords, color, tooltip):
+    folium.Polygon(
+        locations=[(lat, lon) for lon, lat in coords],
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.75,
+        color="black",
+        weight=1,
+        tooltip=tooltip
+    ).add_to(m)
+
+
+def map_cluster_kecamatan(kec_features, geo_map, cluster_col, title):
+    colors = ["#E53935", "#FB8C00", "#FDD835", "#43A047", "#1E88E5", "#8E24AA"]
+    m = folium.Map(location=[-6.25, 107.03], zoom_start=12, tiles="cartodbpositron")
+
+    for _, row in kec_features.iterrows():
+        kec = row["KECAMATAN_UP"]
+        cl = int(row[cluster_col])
+        if kec not in geo_map:
             continue
-        pts.append(jitter_point(lat0, lon0, i))
-    return pts
-
-@st.cache_data
-def get_heatmap_points(df_cl, geo):
-    pts = []
-    for _, row in df_cl.iterrows():
-        lat0, lon0 = get_centroid_from_geojson(geo, row["KECAMATAN"])
-        if lat0 is None:
-            continue
-        pts.append([lat0, lon0])
-    return pts
-
-
-# -----------------------------------------------------------
-# MAP BUILDERS
-# -----------------------------------------------------------
-DOT_COLORS = ["#E53935", "#FB8C00", "#FDD835", "#43A047", "#1E88E5", "#8E24AA", "#00897B", "#3949AB"]
-
-def map_dot(df, geo, cluster_id):
-    df_cl = df[df["CLUSTER_KELUHAN"] == cluster_id]
-    points = get_dot_points(df_cl, geo)
-
-    m = folium.Map(location=[-6.25, 107.03], zoom_start=12)
-    color = DOT_COLORS[cluster_id % len(DOT_COLORS)]
-
-    for lat, lon in points:
-        folium.CircleMarker(
-            location=[lat, lon],
-            radius=3,
-            color=color,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.8
-        ).add_to(m)
+        draw_polygon(
+            m,
+            geo_map[kec],
+            colors[cl % len(colors)],
+            f"{kec}<br>{title}: {cl}"
+        )
     return m
 
 
-def map_heat(df, geo, cluster_id):
-    df_cl = df[df["CLUSTER_KELUHAN"] == cluster_id]
-    points = get_heatmap_points(df_cl, geo)
+def map_keluhan_cluster(df_modeled, kec_features, geo_map, cluster_id):
+    df_cl = df_modeled[df_modeled["CLUSTER_KELUHAN"] == cluster_id]
+    cl_kec = df_cl.groupby("KECAMATAN").size().reset_index(name="JUMLAH")
+    kec_cl = kec_features.merge(cl_kec, on="KECAMATAN", how="left").fillna(0)
 
-    m = folium.Map(location=[-6.25, 107.03], zoom_start=12)
-    if points:
-        HeatMap(points, radius=25, blur=30).add_to(m)
-    return m
+    m = folium.Map(location=[-6.25, 107.03], zoom_start=12, tiles="cartodbpositron")
 
-
-def map_polygon(df, kec_features, geo, cluster_id):
-    df_cl = df[df["CLUSTER_KELUHAN"] == cluster_id]
-    group = df_cl.groupby("KECAMATAN").size().reset_index(name="JML")
-
-    kec_cl = kec_features.merge(group, on="KECAMATAN", how="left")
-    kec_cl["JML"] = kec_cl["JML"].fillna(0)
-
-    m = folium.Map(location=[-6.25, 107.03], zoom_start=12)
-
-    def color(v):
-        if v == 0:
-            return "#E0E0E0"
-        if v <= 5:
-            return "#FFF176"
-        if v <= 15:
-            return "#FFB74D"
+    def get_color(v):
+        v = int(v)
+        if v == 0: return "#E0E0E0"
+        if v <= 5: return "#FFF176"
+        if v <= 15: return "#FFB74D"
         return "#E53935"
 
     for _, row in kec_cl.iterrows():
-        coords = get_polygon_from_geojson(geo, row["KECAMATAN_UP"])
-        if coords is None:
+        kec = row["KECAMATAN_UP"]
+        jumlah = int(row["JUMLAH"])
+        if kec not in geo_map:
             continue
-        folium.Polygon(
-            locations=[(lat, lon) for lon, lat in coords],
-            fill=True,
-            fill_color=color(row["JML"]),
-            color="#555555",
-            weight=1,
-            fill_opacity=0.8,
-            tooltip=f"{row['KECAMATAN']} – {int(row['JML'])} keluhan"
-        ).add_to(m)
+        draw_polygon(
+            m,
+            geo_map[kec],
+            get_color(jumlah),
+            f"{kec}<br>Keluhan CL{cluster_id}: {jumlah}"
+        )
     return m
 
 
-# -----------------------------------------------------------
-# VISUAL – WORDCLOUD & BAR
-# -----------------------------------------------------------
-def show_wordcloud(df, cluster_id):
-    text = " ".join(df[df["CLUSTER_KELUHAN"] == cluster_id]["PERMASALAHAN_CLEAN"])
-    if not text.strip():
-        st.warning("Tidak ada teks pada cluster ini.")
-        return
+# ----------------------------
+# Sidebar: Data input & update
+# ----------------------------
+st.sidebar.header("⚙️ Data & Pengaturan")
 
-    wc = WordCloud(width=800, height=400, background_color="white").generate(text)
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.imshow(wc, interpolation="bilinear")
-    ax.axis("off")
-    st.pyplot(fig)
+uploaded_xlsx = st.sidebar.file_uploader("Upload data XLSX (2024.xlsx)", type=["xlsx"])
+uploaded_geojson = st.sidebar.file_uploader("Upload GeoJSON kecamatan (opsional)", type=["geojson", "json"])
 
-def show_bar(df, cluster_id):
-    df_cl = df[df["CLUSTER_KELUHAN"] == cluster_id]
-    count = df_cl["KECAMATAN"].value_counts()
+k_keluhan = st.sidebar.number_input("Jumlah cluster keluhan (K)", min_value=2, max_value=10, value=5, step=1)
+run_btn = st.sidebar.button("🔁 Proses / Update Model", use_container_width=True)
 
-    fig, ax = plt.subplots(figsize=(6, 4))
-    count.plot(kind="bar", ax=ax)
-    ax.set_title(f"Distribusi Keluhan per Kecamatan – Cluster {cluster_id}")
-    ax.set_xlabel("Kecamatan")
-    ax.set_ylabel("Jumlah Keluhan")
-    ax.grid(axis="y", alpha=0.3)
-    plt.xticks(rotation=45, ha="right")
+st.sidebar.divider()
+st.sidebar.subheader("➕ Tambah Pengaduan (tanpa edit XLSX)")
+with st.sidebar.form("add_row_form", clear_on_submit=True):
+    alamat_new = st.text_input("Alamat", placeholder="Contoh: Jl. ..., Bekasi Timur")
+    permasalahan_new = st.text_area("Permasalahan", placeholder="Contoh: lampu jalan mati...")
+    submit_add = st.form_submit_button("Tambah", use_container_width=True)
+
+
+# ----------------------------
+# Load / store dataset in session
+# ----------------------------
+def load_from_upload(file) -> pd.DataFrame:
+    return pd.read_excel(file)
+
+
+if "raw_df" not in st.session_state:
+    st.session_state.raw_df = None
+
+if uploaded_xlsx is not None:
+    st.session_state.raw_df = load_from_upload(uploaded_xlsx)
+
+# tambah row via form
+if submit_add:
+    if st.session_state.raw_df is None:
+        st.warning("Upload XLSX dulu, baru bisa tambah pengaduan via form.")
+    else:
+        new_row = {"ALAMAT": alamat_new, "PERMASALAHAN": permasalahan_new}
+        st.session_state.raw_df = pd.concat([st.session_state.raw_df, pd.DataFrame([new_row])], ignore_index=True)
+        st.success("Pengaduan berhasil ditambahkan ke dataset (sementara). Klik 'Proses / Update Model'.")
+
+
+# ----------------------------
+# Main content
+# ----------------------------
+if st.session_state.raw_df is None:
+    st.info("Upload file XLSX terlebih dahulu di sidebar. Kolom wajib: ALAMAT, PERMASALAHAN.")
+    st.stop()
+
+# Validate columns
+missing = [c for c in REQUIRED_COLS if c not in st.session_state.raw_df.columns]
+if missing:
+    st.error(f"Kolom wajib tidak lengkap: {missing}. Pastikan XLSX berisi kolom {REQUIRED_COLS}.")
+    st.stop()
+
+# run pipeline
+if run_btn or ("modeled_df" not in st.session_state):
+    with st.spinner("Memproses data (cleaning → TF-IDF → K-Means)…"):
+        try:
+            pre = preprocess_df(st.session_state.raw_df)
+            modeled, X_text, tfidf_obj, sil, top_terms = run_model(pre, k_keluhan=int(k_keluhan))
+            kec_features = build_kecamatan_features(modeled, k_keluhan=int(k_keluhan))
+
+            st.session_state.modeled_df = modeled
+            st.session_state.kec_features = kec_features
+            st.session_state.sil = sil
+            st.session_state.top_terms = top_terms
+        except Exception as e:
+            st.error(f"Gagal memproses: {e}")
+            st.stop()
+
+modeled_df = st.session_state.modeled_df
+kec_features = st.session_state.kec_features
+sil = st.session_state.sil
+top_terms = st.session_state.top_terms
+
+# Download updated dataset
+st.sidebar.divider()
+st.sidebar.subheader("⬇️ Export")
+buffer = io.BytesIO()
+with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    st.session_state.raw_df.to_excel(writer, index=False, sheet_name="DATA_RAW")
+    modeled_df.to_excel(writer, index=False, sheet_name="DATA_CLUSTER")
+    kec_features.to_excel(writer, index=False, sheet_name="KECAMATAN_CLUSTER")
+buffer.seek(0)
+
+st.sidebar.download_button(
+    "Download XLSX (Raw + Cluster + Kecamatan)",
+    data=buffer,
+    file_name=f"hasil_klusterisasi_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True
+)
+
+# Metrics
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total Data (raw)", len(st.session_state.raw_df))
+c2.metric("Total Data (clean)", len(modeled_df))
+c3.metric("Jumlah Kecamatan", modeled_df["KECAMATAN"].nunique())
+c4.metric("Silhouette (K-Means)", "-" if sil is None else f"{sil:.4f}")
+
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["📄 Data", "🧠 Modeling", "🗺️ Peta", "📊 Insight"])
+
+with tab1:
+    st.subheader("Preview Data")
+    st.write("Data setelah preprocessing (cleaning alamat, deteksi kecamatan, cleaning teks).")
+    st.dataframe(modeled_df.head(50), use_container_width=True)
+
+    st.subheader("Ringkasan Keluhan per Kecamatan")
+    ringkas = modeled_df["KECAMATAN"].value_counts().reset_index()
+    ringkas.columns = ["KECAMATAN", "TOTAL"]
+    st.dataframe(ringkas, use_container_width=True)
+
+with tab2:
+    st.subheader("Top Terms per Cluster (K-Means)")
+    cols = st.columns(5 if int(k_keluhan) >= 5 else int(k_keluhan))
+    for i in range(int(k_keluhan)):
+        with cols[i % len(cols)]:
+            st.markdown(f"**Cluster {i}**")
+            st.write(", ".join(top_terms.get(i, [])[:12]))
+
+    st.subheader("Distribusi Cluster Keluhan")
+    vc = modeled_df["CLUSTER_KELUHAN"].value_counts().sort_index()
+    fig = plt.figure()
+    vc.plot(kind="bar", grid=True)
+    plt.title("Jumlah Data per Cluster Keluhan (K-Means)")
+    plt.xlabel("Cluster")
+    plt.ylabel("Jumlah")
     plt.tight_layout()
     st.pyplot(fig)
 
-
-# -----------------------------------------------------------
-# CUSTOM CSS (CLEAN UI)
-# -----------------------------------------------------------
-def inject_css():
-    st.markdown(
-        """
-        <style>
-        /* ruang konten lebih lebar */
-        .main .block-container {
-            max-width: 1100px;
-            padding-top: 1.5rem;
-            padding-bottom: 2rem;
-        }
-
-        /* judul utama */
-        h1 {
-            font-weight: 600 !important;
-        }
-
-        /* card metric */
-        .metric-card {
-            padding: 1rem 1.2rem;
-            border-radius: 0.75rem;
-            border: 1px solid #E5E5E5;
-            background: #FFFFFF;
-            box-shadow: 0px 1px 3px rgba(15, 23, 42, 0.08);
-        }
-
-        .metric-label {
-            font-size: 0.8rem;
-            color: #6B7280;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-        }
-
-        .metric-value {
-            font-size: 1.4rem;
-            font-weight: 600;
-            color: #111827;
-        }
-
-        .metric-sub {
-            font-size: 0.8rem;
-            color: #9CA3AF;
-        }
-
-        /* tab styling */
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 0.5rem;
-        }
-
-        .stTabs [data-baseweb="tab"] {
-            background-color: #F9FAFB;
-            border-radius: 0.75rem;
-            padding-top: 0.4rem;
-            padding-bottom: 0.4rem;
-            padding-left: 0.9rem;
-            padding-right: 0.9rem;
-        }
-
-        .stTabs [aria-selected="true"] {
-            background-color: #111827 !important;
-            color: #F9FAFB !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# -----------------------------------------------------------
-# STREAMLIT MAIN APP
-# -----------------------------------------------------------
-def main():
-    st.set_page_config(
-        page_title="Dashboard Keluhan Kota Bekasi",
-        page_icon="📍",
-        layout="wide",
-    )
-    inject_css()
-
-    st.title("📍 Dashboard Keluhan Kota Bekasi")
-    st.caption("Analisis clustering keluhan warga dan visualisasi sebaran spasial per kecamatan.")
-
-    with st.sidebar:
-        st.header("⚙️ Pengaturan Data")
-        excel = st.file_uploader("Upload Excel (misal: 2024.xlsx)", type=["xlsx"])
-        geo = st.file_uploader("Upload GeoJSON (bekasi_kecamatan.geojson)", type=["geojson", "json"])
-
-        st.markdown("---")
-        st.header("🔢 Parameter Clustering")
-        n_text_clusters = st.slider("Jumlah cluster keluhan", 2, 8, 5)
-        n_kec_clusters = st.slider("Jumlah cluster kecamatan", 2, 8, 4)
-
-        st.markdown("---")
-        st.caption("Pastikan kolom: **ALAMAT** & **PERMASALAHAN** ada di file Excel.")
-
-    if not excel or not geo:
-        st.info("Silakan upload file Excel dan GeoJSON melalui sidebar untuk memulai.")
-        return
-
-    with st.spinner("Memproses data, melakukan TF-IDF dan clustering..."):
+with tab3:
+    st.subheader("Peta (Folium) — Upload GeoJSON untuk menampilkan polygon")
+    if uploaded_geojson is None:
+        st.info("Upload GeoJSON kecamatan di sidebar (opsional). Setelah itu peta polygon akan tampil.")
+    else:
         try:
-            df, kec_features, geojson, sil, terms = process_data(
-                excel, geo, n_text_clusters, n_kec_clusters
-            )
-        except Exception as e:
-            st.error(f"Terjadi error saat memproses data: {e}")
-            return
+            geo = json.load(uploaded_geojson)
+            geo_map = build_geo_map(geo)
 
-    # ================= OVERVIEW =================
-    tab_overview, tab_map, tab_cluster, tab_data = st.tabs(
-        ["📊 Overview", "🗺️ Peta", "🔍 Detail Cluster", "📑 Data"]
-    )
-
-    # ---- OVERVIEW TAB ----
-    with tab_overview:
-        st.subheader("Ringkasan Analisis")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                  <div class="metric-label">Total Keluhan</div>
-                  <div class="metric-value">{len(df):,}</div>
-                  <div class="metric-sub">Baris data setelah cleaning</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with c2:
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                  <div class="metric-label">Jumlah Kecamatan</div>
-                  <div class="metric-value">{df["KECAMATAN"].nunique()}</div>
-                  <div class="metric-sub">Terdeteksi dari kolom alamat</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with c3:
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                  <div class="metric-label">Silhouette Score</div>
-                  <div class="metric-value">{sil:.3f}</div>
-                  <div class="metric-sub">Kualitas cluster keluhan (0–1)</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("### Kualitas Clustering (Silhouette)")
-        fig, ax = plt.subplots(figsize=(4, 1.6))
-        ax.barh(["Model"], [sil], color="#111827")
-        ax.set_xlim(0, 1)
-        ax.set_xlabel("Nilai Silhouette")
-        for i, v in enumerate([sil]):
-            ax.text(v + 0.01, i, f"{v:.3f}", va="center")
-        st.pyplot(fig)
-
-        st.markdown("### Kata-Kata TF-IDF Teratas per Cluster")
-        pilih = st.selectbox("Pilih cluster keluhan:", sorted(terms.keys()))
-        st.write(", ".join(terms[pilih]))
-
-    # ---- MAP TAB ----
-    with tab_map:
-        st.subheader("Visualisasi Peta per Cluster Keluhan")
-
-        col_left, col_right = st.columns([1, 2])
-        with col_left:
-            cluster_id = st.number_input(
-                "Cluster ID keluhan",
-                min_value=0,
-                max_value=n_text_clusters - 1,
-                value=0,
-                step=1,
-            )
-            map_type = st.radio(
-                "Jenis peta",
-                ["Peta Poligon", "Heatmap", "Dot Density"],
-                index=0,
-            )
-
-            st.caption(
-                "• **Poligon** → intensitas keluhan per kecamatan\n"
-                "• **Heatmap** → kepadatan sebaran keluhan\n"
-                "• **Dot** → titik-titik keluhan (dengan jitter stabil)"
-            )
-
-        with col_right:
-            if map_type == "Peta Poligon":
-                map_obj = map_polygon(df, kec_features, geojson, cluster_id)
-            elif map_type == "Heatmap":
-                map_obj = map_heat(df, geojson, cluster_id)
+            if not geo_map:
+                st.warning("GeoJSON terbaca, tapi mapping 'properties.KECAMATAN' tidak ditemukan / kosong.")
             else:
-                map_obj = map_dot(df, geojson, cluster_id)
+                left, right = st.columns(2)
 
-            st_folium(map_obj, width=750, height=520)
+                with left:
+                    st.markdown("**Cluster Kecamatan (K-Means)**")
+                    m1 = map_cluster_kecamatan(kec_features, geo_map, "CLUSTER_KECAMATAN", "Cluster Kecamatan (K-Means)")
+                    st_folium(m1, width=None, height=520)
 
-    # ---- CLUSTER DETAIL TAB ----
-    with tab_cluster:
-        st.subheader("Detail Cluster Keluhan")
+                with right:
+                    st.markdown("**Cluster Kecamatan (K-Medoids)**")
+                    m2 = map_cluster_kecamatan(kec_features, geo_map, "CLUSTER_KECAMATAN_KMEDOID", "Cluster Kecamatan (K-Medoids)")
+                    st_folium(m2, width=None, height=520)
 
-        cl_detail = st.number_input(
-            "Pilih cluster untuk dianalisis",
-            min_value=0,
-            max_value=n_text_clusters - 1,
-            value=0,
-            step=1,
-        )
+                st.divider()
+                st.markdown("**Peta Sebaran Keluhan per Cluster (K-Means)**")
+                cl = st.selectbox("Pilih Cluster Keluhan", list(range(int(k_keluhan))), index=0)
+                m3 = map_keluhan_cluster(modeled_df, kec_features, geo_map, int(cl))
+                st_folium(m3, width=None, height=520)
 
-        col_wc, col_bar = st.columns(2)
-        with col_wc:
-            st.markdown("##### Wordcloud Keluhan")
-            show_wordcloud(df, cl_detail)
+        except Exception as e:
+            st.error(f"Gagal membaca/menampilkan GeoJSON: {e}")
 
-        with col_bar:
-            st.markdown("##### Distribusi Keluhan per Kecamatan")
-            show_bar(df, cl_detail)
+with tab4:
+    st.subheader("Wordcloud & Bar per Cluster")
+    cl = st.selectbox("Pilih Cluster", list(range(int(k_keluhan))), index=0, key="insight_cluster")
 
-    # ---- DATA TAB ----
-    with tab_data:
-        st.subheader("Data yang Digunakan")
+    text = " ".join(modeled_df[modeled_df["CLUSTER_KELUHAN"] == int(cl)]["PERMASALAHAN_CLEAN"].astype(str).tolist()).strip()
+    if not text:
+        st.info("Tidak ada teks di cluster ini.")
+    else:
+        wc = WordCloud(width=900, height=380, background_color="white").generate(text)
+        fig_wc = plt.figure(figsize=(10, 4))
+        plt.imshow(wc)
+        plt.axis("off")
+        plt.tight_layout()
+        st.pyplot(fig_wc)
 
-        st.markdown("#### Sampel Data Keluhan (setelah cleaning)")
-        st.dataframe(df.head(500))
-
-        st.markdown("#### Fitur Agregat per Kecamatan")
-        st.dataframe(kec_features)
-
-
-if __name__ == "__main__":
-    main()
+    st.subheader("Keluhan per Kecamatan (Cluster terpilih)")
+    fig2 = plt.figure()
+    (modeled_df[modeled_df["CLUSTER_KELUHAN"] == int(cl)]["KECAMATAN"]
+        .value_counts()
+        .plot(kind="bar", grid=True))
+    plt.title(f"Keluhan per Kecamatan — Cluster {cl}")
+    plt.xlabel("Kecamatan")
+    plt.ylabel("Jumlah")
+    plt.tight_layout()
+    st.pyplot(fig2)
